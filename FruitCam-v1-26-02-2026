@@ -1,0 +1,262 @@
+import cv2
+import numpy as np
+from collections import deque
+
+# -----------------------------
+# Helpers: feature extraction
+# -----------------------------
+def clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+def circularity(area, perimeter):
+    if perimeter <= 1e-6:
+        return 0.0
+    return (4.0 * np.pi * area) / (perimeter * perimeter)
+
+def get_fruit_mask(frame_bgr):
+    """
+    Simple segmentation:
+    - Convert to HSV
+    - Use saturation/value thresholds to pick "object-like" regions
+    - Morphology to clean
+    Returns: mask (uint8 0/255)
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    # Heuristic thresholds (works reasonably for colorful fruit on plain background)
+    mask = cv2.inRange(hsv, (0, 40, 40), (179, 255, 255))
+
+    # Clean up noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    return mask
+
+def largest_contour(mask):
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    return max(cnts, key=cv2.contourArea)
+
+def extract_features(frame_bgr, mask, cnt):
+    """
+    Returns a dict of features:
+    - Color stats (HSV mean)
+    - Texture stats (edge density, Laplacian variance)
+    - Shape stats (area, perimeter, circularity, aspect ratio, solidity)
+    """
+    features = {}
+
+    # --- Shape ---
+    area = float(cv2.contourArea(cnt))
+    peri = float(cv2.arcLength(cnt, True))
+
+    x, y, w, h = cv2.boundingRect(cnt)
+    aspect = w / float(h + 1e-6)
+
+    hull = cv2.convexHull(cnt)
+    hull_area = float(cv2.contourArea(hull)) + 1e-6
+    solidity = area / hull_area
+
+    circ = circularity(area, peri)
+
+    features["area"] = area
+    features["perimeter"] = peri
+    features["aspect_ratio"] = aspect
+    features["solidity"] = solidity
+    features["circularity"] = circ
+    features["bbox"] = (x, y, w, h)
+
+    # --- Color (HSV mean on masked region) ---
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask_bool = (mask > 0)
+
+    if np.count_nonzero(mask_bool) < 50:
+        # Too small to be reliable
+        features["h_mean"] = 0.0
+        features["s_mean"] = 0.0
+        features["v_mean"] = 0.0
+    else:
+        h_chan, s_chan, v_chan = cv2.split(hsv)
+        features["h_mean"] = float(np.mean(h_chan[mask_bool]))   # 0..179
+        features["s_mean"] = float(np.mean(s_chan[mask_bool]))   # 0..255
+        features["v_mean"] = float(np.mean(v_chan[mask_bool]))   # 0..255
+
+    # --- Texture / wrinkles (edges + Laplacian variance) ---
+    # Work on ROI for speed and better signal
+    x, y, w, h = features["bbox"]
+    roi = frame_bgr[y:y+h, x:x+w]
+    roi_mask = mask[y:y+h, x:x+w]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Edge map (wrinkles/spots tend to increase edges)
+    edges = cv2.Canny(gray, 60, 140)
+    edges = cv2.bitwise_and(edges, edges, mask=roi_mask)
+
+    edge_density = float(np.count_nonzero(edges)) / float(np.count_nonzero(roi_mask) + 1e-6)
+
+    # Laplacian variance: higher often means more fine texture/spots
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    lap = lap * (roi_mask > 0)
+    lap_var = float(np.var(lap[roi_mask > 0])) if np.count_nonzero(roi_mask) > 50 else 0.0
+
+    features["edge_density"] = edge_density
+    features["laplacian_var"] = lap_var
+
+    return features, edges
+
+# -----------------------------
+# “AI” Scoring (heuristic prototype)
+# -----------------------------
+def ripeness_and_rot_score(feat):
+    """
+    Returns:
+    - ripeness_score 0..1 (higher = riper)
+    - rot_risk 0..1 (higher = more likely rotting / spoiled)
+    - notes string
+    This is generic. For a specific fruit (banana/mango/apple), tune thresholds.
+    """
+
+    # Normalize helpful measures
+    s = feat["s_mean"] / 255.0
+    v = feat["v_mean"] / 255.0
+    edge = feat["edge_density"]
+    lapv = feat["laplacian_var"]
+
+    # Texture proxy: combine edge density + lap variance
+    # (wrinkles/spots often increase these)
+    # Scale lap variance into a tame 0..1 range (depends on camera; adjust if needed)
+    lap_norm = clamp(lapv / 800.0, 0.0, 1.0)
+    tex = clamp(0.55 * edge + 0.45 * lap_norm, 0.0, 1.0)
+
+    # Darkness / dullness proxy: low V + low saturation can indicate bruising/spoilage,
+    # but also lighting issues. We handle this gently.
+    dull = clamp((0.55 - v) + (0.35 - s), 0.0, 1.0)
+
+    # Ripeness proxy:
+    # Many fruits: as they ripen, color becomes more saturated (to a point)
+    # and texture slightly increases. This is *very* fruit-dependent.
+    ripeness = clamp(0.55 * s + 0.25 * tex + 0.20 * v, 0.0, 1.0)
+
+    # Rot risk proxy:
+    # Very high texture + dullness tends to correlate with rotting/overripe spotting.
+    rot = clamp(0.55 * tex + 0.35 * dull + 0.10 * (1.0 - s), 0.0, 1.0)
+
+    # Notes (simple explainability)
+    notes = []
+    if tex > 0.35:
+        notes.append("high texture/wrinkles")
+    if dull > 0.25:
+        notes.append("dull/darker areas")
+    if s > 0.55:
+        notes.append("strong color saturation")
+    if v < 0.35:
+        notes.append("low brightness")
+
+    notes_str = ", ".join(notes) if notes else "stable surface/color"
+
+    return ripeness, rot, notes_str
+
+def label_from_scores(ripeness, rot):
+    # Simple decision zones
+    if rot > 0.65:
+        return "Likely SPOILED / ROTTING"
+    if ripeness < 0.35 and rot < 0.45:
+        return "UNRIPE"
+    if 0.35 <= ripeness < 0.65 and rot < 0.55:
+        return "RIPENING"
+    if ripeness >= 0.65 and rot < 0.55:
+        return "RIPE (eat soon)"
+    return "OVER-RIPE / risky"
+
+# -----------------------------
+# Main loop (webcam)
+# -----------------------------
+def main():
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # CAP_DSHOW helps on many Windows setups
+    if not cap.isOpened():
+        print("ERROR: Could not open webcam.")
+        return
+
+    # Smooth outputs a bit so the label doesn't flicker
+    rip_hist = deque(maxlen=10)
+    rot_hist = deque(maxlen=10)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.resize(frame, (960, 540))
+        disp = frame.copy()
+
+        mask = get_fruit_mask(frame)
+        cnt = largest_contour(mask)
+
+        if cnt is not None and cv2.contourArea(cnt) > 4000:
+            feats, edges_roi = extract_features(frame, mask, cnt)
+
+            ripeness, rot, notes = ripeness_and_rot_score(feats)
+            rip_hist.append(ripeness)
+            rot_hist.append(rot)
+
+            rip_s = float(np.mean(rip_hist))
+            rot_s = float(np.mean(rot_hist))
+
+            status = label_from_scores(rip_s, rot_s)
+
+            # Draw contour + bbox
+            cv2.drawContours(disp, [cnt], -1, (0, 255, 0), 2)
+            x, y, w, h = feats["bbox"]
+            cv2.rectangle(disp, (x, y), (x+w, y+h), (255, 180, 0), 2)
+
+            # On-screen text
+            lines = [
+                f"Status: {status}",
+                f"Ripeness score: {rip_s:.2f}   Rot risk: {rot_s:.2f}",
+                f"H mean: {feats['h_mean']:.1f}  S mean: {feats['s_mean']:.1f}  V mean: {feats['v_mean']:.1f}",
+                f"Edge density: {feats['edge_density']:.3f}  LapVar: {feats['laplacian_var']:.1f}",
+                f"Shape - Circ: {feats['circularity']:.2f}  Aspect: {feats['aspect_ratio']:.2f}  Solidity: {feats['solidity']:.2f}",
+                f"Notes: {notes}"
+            ]
+
+            y0 = 25
+            for i, t in enumerate(lines):
+                cv2.putText(disp, t, (10, y0 + i*22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 20), 3, cv2.LINE_AA)
+                cv2.putText(disp, t, (10, y0 + i*22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # Show edge ROI inset (for wrinkles/spots)
+            inset = cv2.resize(edges_roi, (220, 140))
+            inset_bgr = cv2.cvtColor(inset, cv2.COLOR_GRAY2BGR)
+            disp[10:10+140, 720:720+220] = inset_bgr
+            cv2.rectangle(disp, (720, 10), (720+220, 10+140), (255, 255, 255), 1)
+            cv2.putText(disp, "Texture/Edges", (720, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        else:
+            cv2.putText(disp, "Show a fruit on a plain background (move closer).", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 20), 3, cv2.LINE_AA)
+            cv2.putText(disp, "Show a fruit on a plain background (move closer).", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Show mask preview small
+        mask_small = cv2.resize(mask, (240, 135))
+        mask_small = cv2.cvtColor(mask_small, cv2.COLOR_GRAY2BGR)
+        disp[395:395+135, 10:10+240] = mask_small
+        cv2.rectangle(disp, (10, 395), (10+240, 395+135), (255, 255, 255), 1)
+        cv2.putText(disp, "Mask", (10, 390), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        cv2.imshow("Fruit Ageing Assessment (Prototype)", disp)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27 or key == ord('q'):   # ESC or q
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
