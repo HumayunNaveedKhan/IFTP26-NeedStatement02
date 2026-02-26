@@ -1,0 +1,300 @@
+import cv2
+import numpy as np
+from collections import deque
+
+# =============================
+# Camera selection utilities
+# =============================
+def list_available_cameras(max_index=10, backend=cv2.CAP_DSHOW):
+    """Return list of (index, frame_shape) that can be opened."""
+    found = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i, backend)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        ok, frame = cap.read()
+        cap.release()
+        if ok and frame is not None:
+            found.append((i, frame.shape))
+    return found
+
+def choose_camera_interactive(max_index=10):
+    """
+    Shows a simple selection window.
+    Press a digit key (0..9) to choose that camera index.
+    ESC to quit.
+    """
+    cams = list_available_cameras(max_index=max_index)
+    if not cams:
+        raise RuntimeError("No cameras found. Check USB webcam connection/drivers.")
+
+    print("Detected cameras:")
+    for idx, shp in cams:
+        print(f"  Index {idx} -> frame shape {shp}")
+
+    # Preview windows for each detected camera (quick, sequential)
+    print("\nPreviewing detected cameras (2 seconds each)...")
+    for idx, _ in cams:
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        start = cv2.getTickCount()
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame = cv2.resize(frame, (960, 540))
+            cv2.putText(frame, f"Camera Index: {idx}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.imshow("Camera Preview (auto)", frame)
+
+            # ~2 seconds per camera
+            elapsed = (cv2.getTickCount() - start) / cv2.getTickFrequency()
+            if elapsed > 2.0:
+                break
+
+            if (cv2.waitKey(1) & 0xFF) == 27:
+                cap.release()
+                cv2.destroyAllWindows()
+                raise SystemExit
+
+        cap.release()
+
+    cv2.destroyAllWindows()
+
+    print("\nNow choose your EXTERNAL webcam.")
+    print("Type the camera index number and press Enter (example: 1):")
+    try:
+        chosen = int(input("> ").strip())
+    except:
+        raise RuntimeError("Invalid input. Please enter a number like 1.")
+
+    return chosen
+
+# =============================
+# Feature extraction helpers
+# =============================
+def clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+def circularity(area, perimeter):
+    if perimeter <= 1e-6:
+        return 0.0
+    return (4.0 * np.pi * area) / (perimeter * perimeter)
+
+def get_fruit_mask(frame_bgr):
+    """
+    Generic fruit segmentation:
+    - HSV threshold for "colorful object" (works best with plain background)
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (0, 40, 40), (179, 255, 255))
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return mask
+
+def largest_contour(mask):
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    return max(cnts, key=cv2.contourArea)
+
+def extract_features(frame_bgr, mask, cnt):
+    features = {}
+
+    # ---- Shape ----
+    area = float(cv2.contourArea(cnt))
+    peri = float(cv2.arcLength(cnt, True))
+    x, y, w, h = cv2.boundingRect(cnt)
+    aspect = w / float(h + 1e-6)
+
+    hull = cv2.convexHull(cnt)
+    hull_area = float(cv2.contourArea(hull)) + 1e-6
+    solidity = area / hull_area
+    circ = circularity(area, peri)
+
+    features["area"] = area
+    features["perimeter"] = peri
+    features["aspect_ratio"] = aspect
+    features["solidity"] = solidity
+    features["circularity"] = circ
+    features["bbox"] = (x, y, w, h)
+
+    # ---- Color (HSV mean on masked fruit pixels) ----
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask_bool = (mask > 0)
+
+    if np.count_nonzero(mask_bool) < 200:
+        features["h_mean"] = 0.0
+        features["s_mean"] = 0.0
+        features["v_mean"] = 0.0
+    else:
+        h_chan, s_chan, v_chan = cv2.split(hsv)
+        features["h_mean"] = float(np.mean(h_chan[mask_bool]))  # 0..179
+        features["s_mean"] = float(np.mean(s_chan[mask_bool]))  # 0..255
+        features["v_mean"] = float(np.mean(v_chan[mask_bool]))  # 0..255
+
+    # ---- Texture / wrinkles ----
+    x, y, w, h = features["bbox"]
+    roi = frame_bgr[y:y+h, x:x+w]
+    roi_mask = mask[y:y+h, x:x+w]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(gray, 60, 140)
+    edges = cv2.bitwise_and(edges, edges, mask=roi_mask)
+
+    edge_density = float(np.count_nonzero(edges)) / float(np.count_nonzero(roi_mask) + 1e-6)
+
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    lap = lap * (roi_mask > 0)
+    lap_var = float(np.var(lap[roi_mask > 0])) if np.count_nonzero(roi_mask) > 200 else 0.0
+
+    features["edge_density"] = edge_density
+    features["laplacian_var"] = lap_var
+
+    return features, edges
+
+# =============================
+# Scoring (prototype heuristic)
+# =============================
+def ripeness_and_rot_score(feat):
+    s = feat["s_mean"] / 255.0
+    v = feat["v_mean"] / 255.0
+    edge = feat["edge_density"]
+    lapv = feat["laplacian_var"]
+
+    lap_norm = clamp(lapv / 800.0, 0.0, 1.0)
+    tex = clamp(0.55 * edge + 0.45 * lap_norm, 0.0, 1.0)
+
+    dull = clamp((0.55 - v) + (0.35 - s), 0.0, 1.0)
+
+    ripeness = clamp(0.55 * s + 0.25 * tex + 0.20 * v, 0.0, 1.0)
+    rot = clamp(0.55 * tex + 0.35 * dull + 0.10 * (1.0 - s), 0.0, 1.0)
+
+    notes = []
+    if tex > 0.35:
+        notes.append("wrinkles/spots↑")
+    if dull > 0.25:
+        notes.append("dull/dark patches")
+    if s > 0.55:
+        notes.append("color saturation↑")
+    if v < 0.35:
+        notes.append("brightness↓")
+    notes_str = ", ".join(notes) if notes else "stable surface/color"
+
+    return ripeness, rot, notes_str
+
+def label_from_scores(ripeness, rot):
+    if rot > 0.65:
+        return "Likely SPOILED / ROTTING"
+    if ripeness < 0.35 and rot < 0.45:
+        return "UNRIPE"
+    if 0.35 <= ripeness < 0.65 and rot < 0.55:
+        return "RIPENING"
+    if ripeness >= 0.65 and rot < 0.55:
+        return "RIPE (eat soon)"
+    return "OVER-RIPE / risky"
+
+# =============================
+# Main
+# =============================
+def main():
+    cam_index = choose_camera_interactive(max_index=10)
+
+    cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {cam_index}.")
+
+    # Force a nicer resolution if supported
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
+    rip_hist = deque(maxlen=10)
+    rot_hist = deque(maxlen=10)
+
+    print("\nControls:")
+    print("  q / ESC  -> quit")
+
+    while True:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            break
+
+        frame = cv2.resize(frame, (960, 540))
+        disp = frame.copy()
+
+        mask = get_fruit_mask(frame)
+        cnt = largest_contour(mask)
+
+        if cnt is not None and cv2.contourArea(cnt) > 4000:
+            feats, edges_roi = extract_features(frame, mask, cnt)
+
+            ripeness, rot, notes = ripeness_and_rot_score(feats)
+            rip_hist.append(ripeness)
+            rot_hist.append(rot)
+
+            rip_s = float(np.mean(rip_hist))
+            rot_s = float(np.mean(rot_hist))
+            status = label_from_scores(rip_s, rot_s)
+
+            # Draw contour + bbox
+            cv2.drawContours(disp, [cnt], -1, (0, 255, 0), 2)
+            x, y, w, h = feats["bbox"]
+            cv2.rectangle(disp, (x, y), (x+w, y+h), (255, 180, 0), 2)
+
+            lines = [
+                f"Camera: {cam_index} (external if you selected it)",
+                f"Status: {status}",
+                f"Ripeness: {rip_s:.2f}   Rot risk: {rot_s:.2f}",
+                f"H:{feats['h_mean']:.1f} S:{feats['s_mean']:.1f} V:{feats['v_mean']:.1f}",
+                f"EdgeD:{feats['edge_density']:.3f} LapVar:{feats['laplacian_var']:.1f}",
+                f"Circ:{feats['circularity']:.2f} Aspect:{feats['aspect_ratio']:.2f} Sol:{feats['solidity']:.2f}",
+                f"Notes: {notes}"
+            ]
+
+            y0 = 24
+            for i, t in enumerate(lines):
+                cv2.putText(disp, t, (10, y0 + i*22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 20, 20), 3, cv2.LINE_AA)
+                cv2.putText(disp, t, (10, y0 + i*22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # Texture inset
+            inset = cv2.resize(edges_roi, (220, 140))
+            inset_bgr = cv2.cvtColor(inset, cv2.COLOR_GRAY2BGR)
+            disp[10:10+140, 720:720+220] = inset_bgr
+            cv2.rectangle(disp, (720, 10), (720+220, 10+140), (255, 255, 255), 1)
+            cv2.putText(disp, "Texture/Edges", (720, 165),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        else:
+            cv2.putText(disp, "Show fruit on plain background, move closer, improve light.", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 20), 3, cv2.LINE_AA)
+            cv2.putText(disp, "Show fruit on plain background, move closer, improve light.", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Mask preview
+        mask_small = cv2.resize(mask, (240, 135))
+        mask_small = cv2.cvtColor(mask_small, cv2.COLOR_GRAY2BGR)
+        disp[395:395+135, 10:10+240] = mask_small
+        cv2.rectangle(disp, (10, 395), (10+240, 395+135), (255, 255, 255), 1)
+        cv2.putText(disp, "Mask", (10, 390),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        cv2.imshow("Fruit Ageing Assessment (External Webcam)", disp)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in [27, ord('q')]:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
