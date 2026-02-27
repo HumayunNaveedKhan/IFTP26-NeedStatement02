@@ -1,0 +1,292 @@
+import cv2
+import numpy as np
+
+CAM_INDEX = 1
+DISPLAY_W, DISPLAY_H = 960, 540
+
+# Karachi warm, unrefrigerated rough remaining days from RIPE to ROT
+RIPE_TO_ROT_DAYS = {"Banana": 3.0, "Orange": 6.0, "Apple": 7.0}
+
+def clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+def draw_panel(img, lines, x=10, y=28, line_h=28):
+    for i, text in enumerate(lines):
+        yy = y + i * line_h
+        cv2.putText(img, text, (x, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(img, text, (x, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 1, cv2.LINE_AA)
+
+def largest_contour(mask):
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    return max(cnts, key=cv2.contourArea)
+
+# =========================
+# Background calibrated segmentation
+# =========================
+class BackgroundSegmenter:
+    def __init__(self):
+        self.bg_lab = None
+        self.ready = False
+        self.thresh = 20  # you can tune with [ and ]
+
+    def calibrate(self, frame_bgr):
+        lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+        self.bg_lab = cv2.GaussianBlur(lab, (7, 7), 0)
+        self.ready = True
+
+    def mask(self, frame_bgr):
+        if not self.ready:
+            return None
+        lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+        lab = cv2.GaussianBlur(lab, (7, 7), 0)
+
+        diff = lab.astype(np.int16) - self.bg_lab.astype(np.int16)
+        dist = np.sqrt((diff[..., 0] ** 2) + (diff[..., 1] ** 2) + (diff[..., 2] ** 2)).astype(np.uint8)
+
+        _, mask = cv2.threshold(dist, self.thresh, 255, cv2.THRESH_BINARY)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        return mask
+
+# =========================
+# Symptom detectors
+# =========================
+def black_coverage(frame_bgr, mask):
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    v = hsv[..., 2]
+    m = mask > 0
+    if np.count_nonzero(m) < 300:
+        return 0.0
+    black = (v < 55) & m
+    return float(np.count_nonzero(black)) / float(np.count_nonzero(m) + 1e-6)
+
+def spot_coverage(frame_bgr, mask):
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    s = hsv[..., 1]
+    v = hsv[..., 2]
+    m = mask > 0
+    if np.count_nonzero(m) < 300:
+        return 0.0
+    spots = (v < 120) & (s > 35) & m
+    return float(np.count_nonzero(spots)) / float(np.count_nonzero(m) + 1e-6)
+
+def wrinkle_level(frame_bgr, mask, bbox):
+    x, y, w, h = bbox
+    roi = frame_bgr[y:y+h, x:x+w]
+    roi_mask = mask[y:y+h, x:x+w]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 60, 140)
+    edges = cv2.bitwise_and(edges, edges, mask=roi_mask)
+
+    denom = float(np.count_nonzero(roi_mask) + 1e-6)
+    ed = float(np.count_nonzero(edges)) / denom
+    return clamp(ed / 0.08, 0.0, 1.0)
+
+def mold_proxy(frame_bgr, mask):
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    s = hsv[..., 1]
+    v = hsv[..., 2]
+    m = mask > 0
+    if np.count_nonzero(m) < 300:
+        return 0.0
+    mold = (v > 205) & (s < 55) & m
+    return float(np.count_nonzero(mold)) / float(np.count_nonzero(m) + 1e-6)
+
+# =========================
+# Stage logic per fruit
+# =========================
+def banana_stage_days(black_pct, spot_pct):
+    # Banana: blackening is the strongest rot signal
+    if black_pct > 0.22:
+        stage = "ROTTEN"
+    elif black_pct > 0.12 or spot_pct > 0.22:
+        stage = "ABOUT TO ROT"
+    elif spot_pct > 0.10:
+        stage = "RIPE"
+    else:
+        stage = "UNRIPE / RIPENING"
+
+    total = RIPE_TO_ROT_DAYS["Banana"]
+    severity = clamp(0.80 * black_pct + 0.20 * spot_pct, 0.0, 1.0)
+    days_left = clamp((1.0 - severity) * total, 0.0, total)
+    if stage == "ROTTEN":
+        days_left = 0.0
+
+    symptoms = []
+    if spot_pct > 0.08: symptoms.append("Brown spots")
+    if black_pct > 0.08: symptoms.append("Blackening")
+    return stage, days_left, symptoms
+
+def orange_stage_days(mold_pct, spot_pct, wrinkle):
+    # Orange: mold and dark patching
+    if mold_pct > 0.030:
+        stage = "ROTTEN"
+    elif spot_pct > 0.22 or wrinkle > 0.60:
+        stage = "ABOUT TO ROT"
+    elif spot_pct > 0.12:
+        stage = "RIPE"
+    else:
+        stage = "RIPE / OK"
+
+    total = RIPE_TO_ROT_DAYS["Orange"]
+    severity = clamp(0.70 * spot_pct + 0.30 * clamp(mold_pct * 20.0, 0, 1), 0.0, 1.0)
+    days_left = clamp((1.0 - severity) * total, 0.0, total)
+    if stage == "ROTTEN":
+        days_left = 0.0
+
+    symptoms = []
+    if spot_pct > 0.10: symptoms.append("Dark patches/spots")
+    if wrinkle > 0.55: symptoms.append("Shriveling")
+    if mold_pct > 0.020: symptoms.append("Possible mold")
+    return stage, days_left, symptoms
+
+def apple_stage_days(spot_pct, wrinkle, mold_pct):
+    # Apple: spots + wrinkles; mold only if significant
+    if mold_pct > 0.035:
+        stage = "ROTTEN"
+    elif spot_pct > 0.20 or wrinkle > 0.65:
+        stage = "ABOUT TO ROT"
+    elif spot_pct > 0.12:
+        stage = "RIPE"
+    else:
+        stage = "UNRIPE / RIPENING"
+
+    total = RIPE_TO_ROT_DAYS["Apple"]
+    severity = clamp(0.65 * spot_pct + 0.25 * wrinkle + 0.10 * clamp(mold_pct * 15.0, 0, 1), 0.0, 1.0)
+    days_left = clamp((1.0 - severity) * total, 0.0, total)
+    if stage == "ROTTEN":
+        days_left = 0.0
+
+    symptoms = []
+    if spot_pct > 0.10: symptoms.append("Dark spots")
+    if wrinkle > 0.55: symptoms.append("Wrinkles")
+    if mold_pct > 0.025: symptoms.append("Possible mold")
+    return stage, days_left, symptoms
+
+# =========================
+# Main
+# =========================
+def main():
+    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {CAM_INDEX}")
+
+    seg = BackgroundSegmenter()
+    fruit = "Orange"  # default start
+
+    print("Controls:")
+    print("  C: calibrate background (EMPTY BOX)")
+    print("  1/2/3: select fruit Banana/Orange/Apple")
+    print("  [ / ]: decrease/increase segmentation threshold")
+    print("  Q/ESC: quit")
+
+    while True:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            break
+
+        frame = cv2.resize(frame, (DISPLAY_W, DISPLAY_H))
+        disp = frame.copy()
+
+        if not seg.ready:
+            draw_panel(disp, [
+                "NOT CALIBRATED",
+                "Remove fruit (empty box) then press C",
+                "Select fruit: 1=Banana  2=Orange  3=Apple"
+            ])
+            cv2.imshow("Fruit Ageing Dashboard", disp)
+            k = cv2.waitKey(1) & 0xFF
+            if k in [27, ord('q'), ord('Q')]:
+                break
+            if k in [ord('c'), ord('C')]:
+                seg.calibrate(frame)
+            if k == ord('1'): fruit = "Banana"
+            if k == ord('2'): fruit = "Orange"
+            if k == ord('3'): fruit = "Apple"
+            continue
+
+        mask = seg.mask(frame)
+        cnt = largest_contour(mask)
+
+        if cnt is None or cv2.contourArea(cnt) < 3500:
+            draw_panel(disp, [
+                f"Fruit selected: {fruit}",
+                "No fruit detected",
+                "Place ONE fruit in box",
+                "Press C if lighting changed"
+            ])
+            cv2.imshow("Fruit Ageing Dashboard", disp)
+            k = cv2.waitKey(1) & 0xFF
+            if k in [27, ord('q'), ord('Q')]:
+                break
+            if k in [ord('c'), ord('C')]:
+                seg.calibrate(frame)
+            if k == ord('1'): fruit = "Banana"
+            if k == ord('2'): fruit = "Orange"
+            if k == ord('3'): fruit = "Apple"
+            if k == ord('['): seg.thresh = max(8, seg.thresh - 1)
+            if k == ord(']'): seg.thresh = min(60, seg.thresh + 1)
+            continue
+
+        # draw contour + bbox
+        cv2.drawContours(disp, [cnt], -1, (0, 255, 0), 2)
+        x, y, w, h = cv2.boundingRect(cnt)
+        cv2.rectangle(disp, (x, y), (x+w, y+h), (255, 180, 0), 2)
+
+        blk = black_coverage(frame, mask)
+        spot = spot_coverage(frame, mask)
+        wr = wrinkle_level(frame, mask, (x, y, w, h))
+        mold = mold_proxy(frame, mask)
+
+        if fruit == "Banana":
+            stage, days_left, symptoms = banana_stage_days(blk, spot)
+            feature_line = f"Blackness: {int(blk*100)}% | Spots: {int(spot*100)}%"
+        elif fruit == "Orange":
+            stage, days_left, symptoms = orange_stage_days(mold, spot, wr)
+            feature_line = f"Spots: {int(spot*100)}% | Mold risk: {int(mold*100)}%"
+        else:
+            stage, days_left, symptoms = apple_stage_days(spot, wr, mold)
+            feature_line = f"Spots: {int(spot*100)}% | Wrinkles: {int(wr*100)}% | Mold: {int(mold*100)}%"
+
+        symptom_line = "Symptoms: " + (", ".join(symptoms) if symptoms else "None obvious")
+
+        draw_panel(disp, [
+            f"Fruit: {fruit}  (press 1/2/3 to change)",
+            f"Stage: {stage}",
+            f"Days remaining (est.): {days_left:.1f} days",
+            feature_line,
+            symptom_line,
+            f"Seg threshold: {seg.thresh}  (use [ and ])"
+        ])
+
+        # small mask preview
+        mask_small = cv2.resize(mask, (220, 120))
+        mask_small = cv2.cvtColor(mask_small, cv2.COLOR_GRAY2BGR)
+        disp[DISPLAY_H-130:DISPLAY_H-10, 10:230] = mask_small
+        cv2.rectangle(disp, (10, DISPLAY_H-130), (230, DISPLAY_H-10), (255, 255, 255), 1)
+        cv2.putText(disp, "Mask", (10, DISPLAY_H-136), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+
+        cv2.imshow("Fruit Ageing Dashboard", disp)
+
+        k = cv2.waitKey(1) & 0xFF
+        if k in [27, ord('q'), ord('Q')]:
+            break
+        if k in [ord('c'), ord('C')]:
+            seg.calibrate(frame)
+        if k == ord('1'): fruit = "Banana"
+        if k == ord('2'): fruit = "Orange"
+        if k == ord('3'): fruit = "Apple"
+        if k == ord('['): seg.thresh = max(8, seg.thresh - 1)
+        if k == ord(']'): seg.thresh = min(60, seg.thresh + 1)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
