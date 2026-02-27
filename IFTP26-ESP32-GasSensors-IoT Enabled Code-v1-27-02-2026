@@ -1,0 +1,291 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+// #include <url_encode.h>   // If not available, remove and use simple string (see note below)
+
+// -------------------- USER SETTINGS --------------------
+const char* WIFI_SSID = "HHRCM";
+const char* WIFI_PASS = "24456883";
+
+// Replace after deploying Apps Script Web App
+String SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwSaG29aVPVs-X5n24XvL3dDOHyGu6HNP4GEpU03GGjDybb1qIrWCackRIQ3OtSDOkE/exec";
+
+// -------------------- PINS (ESP32 ADC1 recommended) --------------------
+#define MQ2_PIN     4   // ADC1_CH6 (safe with WiFi)
+#define MQ3_PIN     5   // ADC1_CH7 (safe with WiFi)
+#define BUTTON_PIN  18   // Push button to GND (INPUT_PULLUP)
+
+// -------------------- GLOBALS --------------------
+int mq2_baseline = 0;
+int mq3_baseline = 0;
+
+unsigned long lastButtonPressMs = 0;
+const unsigned long debounceMs = 250;
+
+// -------------------- FUNCTION DECLARATIONS --------------------
+void connectWiFi();
+bool sendToGoogleSheet(int mq2_value, int mq3_value, int mq2_diff, int mq3_diff, String statusText, String gasesText);
+String detectStatusAndGases(int mq2_diff, int mq3_diff, String &gasesText);
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // ADC setup (optional but useful for consistency)
+  analogReadResolution(12); // ESP32 default is 12-bit (0-4095)
+  // analogSetAttenuation(ADC_11db); // optional if needed for wider voltage range
+
+  Serial.println("\nMQ-2 + MQ-3 Fruit Gas Detection (ESP32 + Google Sheets)");
+  Serial.println("Connecting WiFi...");
+  connectWiFi();
+
+  Serial.println("Warming up sensors...");
+  delay(30000);   // MQ sensors warm-up
+
+  // Baseline readings (NO fruit present)
+  mq2_baseline = analogRead(MQ2_PIN);
+  mq3_baseline = analogRead(MQ3_PIN);
+
+  Serial.print("MQ-2 Baseline: ");
+  Serial.println(mq2_baseline);
+  Serial.print("MQ-3 Baseline: ");
+  Serial.println(mq3_baseline);
+  Serial.println("-------------------------");
+}
+
+void loop() {
+  // Reconnect WiFi if dropped
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  // Button NOT pressed
+  if (digitalRead(BUTTON_PIN) == HIGH) {
+    Serial.println("Press button to take readings...");
+    delay(1500);
+    return;
+  }
+
+  // Debounce
+  if (millis() - lastButtonPressMs < debounceMs) {
+    delay(50);
+    return;
+  }
+  lastButtonPressMs = millis();
+
+  // Button pressed → take sensor readings
+  int mq2_value = analogRead(MQ2_PIN);
+  int mq3_value = analogRead(MQ3_PIN);
+
+  int mq2_diff = mq2_value - mq2_baseline;
+  int mq3_diff = mq3_value - mq3_baseline;
+
+  Serial.print("MQ-2: ");
+  Serial.print(mq2_value);
+  Serial.print(" (Δ ");
+  Serial.print(mq2_diff);
+  Serial.print(")");
+
+  Serial.print(" | MQ-3: ");
+  Serial.print(mq3_value);
+  Serial.print(" (Δ ");
+  Serial.print(mq3_diff);
+  Serial.println(")");
+
+  String gasesText = "";
+  String statusText = detectStatusAndGases(mq2_diff, mq3_diff, gasesText);
+
+  Serial.print("Status: ");
+  Serial.println(statusText);
+  if (gasesText.length() > 0) {
+    Serial.println("Detected gases:");
+    Serial.println(gasesText);
+  }
+
+  // Send to Google Sheet
+  bool ok = sendToGoogleSheet(mq2_value, mq3_value, mq2_diff, mq3_diff, statusText, gasesText);
+  if (ok) {
+    Serial.println("✅ Logged to Google Sheet");
+  } else {
+    Serial.println("❌ Failed to log to Google Sheet");
+  }
+
+  Serial.println("-------------------------");
+
+  // Wait for button release to avoid repeated sends while held
+  while (digitalRead(BUTTON_PIN) == LOW) {
+    delay(20);
+  }
+
+  delay(500);
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.print("Connecting");
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 30) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected! IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connection failed.");
+  }
+}
+
+String detectStatusAndGases(int mq2_diff, int mq3_diff, String &gasesText) {
+  gasesText = "";
+
+  if (mq2_diff < 10 && mq3_diff < 10) {
+    return "FRUIT IS NOT PRESENT";
+  }
+
+  String status = "FRUIT IS PRESENT";
+
+  // MQ-3 → Alcohol / Ethanol
+  if (mq3_diff >= 80) {
+    gasesText += "Ethanol / Alcohol vapors (Ripening / Fermentation); ";
+  }
+
+  // MQ-2 → VOCs / Combustible gases
+  if (mq2_diff >= 150 && mq2_diff < 300) {
+    gasesText += "Organic vapors / VOCs (Ripening fruit); ";
+  } else if (mq2_diff >= 300) {
+    gasesText += "High VOCs / Combustible gases (Rotting fruit); ";
+  }
+
+  // Fresh fruit
+  if (mq2_diff >= 50 && mq2_diff < 150 && mq3_diff < 80) {
+    gasesText += "Low VOCs (Fresh fruit gases); ";
+  }
+
+  if (gasesText.length() == 0) {
+    gasesText = "No major gas category triggered";
+  }
+
+  return status;
+}
+
+bool sendToGoogleSheet(int mq2_value, int mq3_value, int mq2_diff, int mq3_diff, String statusText, String gasesText) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure(); // Easier for testing. For production, use certificate validation.
+
+  HTTPClient https;
+  if (!https.begin(client, SCRIPT_URL)) {
+    Serial.println("HTTPS begin failed");
+    return false;
+  }
+
+  https.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  // Build POST body
+  // Timestamp will be created in Apps Script (server-side)
+  String postData = "";
+  postData += "device=ESP32_FruitNode";
+  postData += "&mq2=" + String(mq2_value);
+  postData += "&mq3=" + String(mq3_value);
+  postData += "&mq2_diff=" + String(mq2_diff);
+  postData += "&mq3_diff=" + String(mq3_diff);
+  postData += "&status=" + statusText;
+  postData += "&gases=" + gasesText;
+  postData += "&rssi=" + String(WiFi.RSSI());
+
+  int httpCode = https.POST(postData);
+  String response = https.getString();
+
+  Serial.print("HTTP Code: ");
+  Serial.println(httpCode);
+  Serial.print("Server Response: ");
+  Serial.println(response);
+
+  https.end();
+
+  return (httpCode > 0 && httpCode < 400);
+}   __________________________________________________________________________________________________________________________________________________________________// ====== CONFIG ======
+const SHEET_ID = "1B54bM-2oQpDQa7wE1s79cRAGwHjnuwZOJJnKJ04LJ60";
+const SHEET_NAME = "Sheet1"; // Change if your tab name is different
+
+function doGet(e) {
+  return handleRequest(e);
+}
+
+function doPost(e) {
+  return handleRequest(e);
+}
+
+function handleRequest(e) {
+  try {
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
+
+    // Create headers if empty
+    if (sheet.getLastRow() === 0) {
+      sheet.appendRow([
+        "Timestamp",
+        "Device",
+        "MQ2 Raw",
+        "MQ3 Raw",
+        "MQ2 Diff",
+        "MQ3 Diff",
+        "Status",
+        "Detected Gases",
+        "RSSI",
+        "Source IP / Note"
+      ]);
+    }
+
+    const p = e.parameter || {};
+
+    // Server-side timestamp (Pakistan time)
+    const timestamp = Utilities.formatDate(new Date(), "Asia/Karachi", "yyyy-MM-dd HH:mm:ss");
+
+    const row = [
+      timestamp,
+      p.device || "Unknown",
+      toNumberOrKeep(p.mq2),
+      toNumberOrKeep(p.mq3),
+      toNumberOrKeep(p.mq2_diff),
+      toNumberOrKeep(p.mq3_diff),
+      p.status || "",
+      p.gases || "",
+      toNumberOrKeep(p.rssi),
+      (p.note || "")
+    ];
+
+    sheet.appendRow(row);
+
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        success: true,
+        message: "Row added",
+        timestamp: timestamp
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        success: false,
+        error: err.toString()
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+function toNumberOrKeep(v) {
+  if (v === undefined || v === null || v === "") return "";
+  const n = Number(v);
+  return isNaN(n) ? v : n;
+}
