@@ -257,7 +257,7 @@ def main():
         symptom_line = "Symptoms: " + (", ".join(symptoms) if symptoms else "None obvious")
 
         draw_panel(disp, [
-            f"Fruit: {fruit}  (press 1/2/3 to change)",
+            f"Fruit: {fruit}  ()",
             f"Stage: {stage}",
             f"Days remaining (est.): {days_left:.1f} days",
             feature_line,
