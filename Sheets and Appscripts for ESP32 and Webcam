@@ -1,0 +1,124 @@
+https://docs.google.com/spreadsheets/d/1fMB2ZEP1qLwFI4xxlQfuQO08MlpMt-gDL3NEyclWXsw/edit?gid=0#gid=0
+
+// ✅ Put your Google Sheet ID here (the long string in the sheet URL)
+const SHEET_ID = "1fMB2ZEP1qLwFI4xxlQfuQO08MlpMt-gDL3NEyclWXsw";
+const SHEET_NAME = "Sheet1";
+
+function setupSheet_() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
+
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(["Timestamp", "Fruit", "Stage", "DaysRemaining", "Symptoms"]);
+  }
+  return sh;
+}
+
+// Web App endpoint: GET request
+function doGet(e) {
+  try {
+    const sh = setupSheet_();
+
+    const fruit = (e.parameter.fruit || "").toString();
+    const stage = (e.parameter.stage || "").toString();
+    const daysRemaining = (e.parameter.daysRemaining || "").toString();
+    const symptoms = (e.parameter.symptoms || "").toString();
+
+    const ts = new Date(); // server timestamp
+    sh.appendRow([ts, fruit, stage, daysRemaining, symptoms]);
+
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: true }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: false, error: err.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+
+
+https://docs.google.com/spreadsheets/d/1B54bM-2oQpDQa7wE1s79cRAGwHjnuwZOJJnKJ04LJ60/edit?gid=0#gid=0
+
+
+
+// ====== CONFIG ======
+const SHEET_ID = "1B54bM-2oQpDQa7wE1s79cRAGwHjnuwZOJJnKJ04LJ60";
+const SHEET_NAME = "Sheet1"; // Change if your tab name is different
+
+function doGet(e) {
+  return handleRequest(e);
+}
+
+function doPost(e) {
+  return handleRequest(e);
+}
+
+function handleRequest(e) {
+  try {
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
+
+    // Create headers if empty
+    if (sheet.getLastRow() === 0) {
+      sheet.appendRow([
+        "Timestamp",
+        "Device",
+        "MQ2 Raw",
+        "MQ3 Raw",
+        "MQ2 Diff",
+        "MQ3 Diff",
+        "Status",
+        "Detected Gases",
+        "RSSI",
+        "Source IP / Note"
+      ]);
+    }
+
+    const p = e.parameter || {};
+
+    // Server-side timestamp (Pakistan time)
+    const timestamp = Utilities.formatDate(new Date(), "Asia/Karachi", "yyyy-MM-dd HH:mm:ss");
+
+    const row = [
+      timestamp,
+      p.device || "Unknown",
+      toNumberOrKeep(p.mq2),
+      toNumberOrKeep(p.mq3),
+      toNumberOrKeep(p.mq2_diff),
+      toNumberOrKeep(p.mq3_diff),
+      p.status || "",
+      p.gases || "",
+      toNumberOrKeep(p.rssi),
+      (p.note || "")
+    ];
+
+    sheet.appendRow(row);
+
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        success: true,
+        message: "Row added",
+        timestamp: timestamp
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        success: false,
+        error: err.toString()
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+function toNumberOrKeep(v) {
+  if (v === undefined || v === null || v === "") return "";
+  const n = Number(v);
+  return isNaN(n) ? v : n;
+}
+
+
